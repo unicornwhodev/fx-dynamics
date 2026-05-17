@@ -1,0 +1,13 @@
+{
+  "plugin": "Musique Compressor",
+  "presets": [
+    {"name":"Vocal Glue", "threshold":-19.0, "ratio":3.0, "attack":8.0, "release":95.0, "makeup":2.2, "mix":100.0, "output":0.0, "rms_mode":true, "bypass":false, "mono":false},
+    {"name":"Drum Smash", "threshold":-26.0, "ratio":8.0, "attack":2.0, "release":70.0, "makeup":5.5, "mix":82.0, "output":-1.0, "rms_mode":false, "bypass":false, "mono":false},
+    {"name":"Master Gentle", "threshold":-14.0, "ratio":1.8, "attack":22.0, "release":180.0, "makeup":1.1, "mix":100.0, "output":-0.5, "rms_mode":true, "bypass":false, "mono":false},
+    {"name":"Bass Control", "threshold":-21.0, "ratio":4.5, "attack":12.0, "release":130.0, "makeup":2.8, "mix":96.0, "output":-0.7, "rms_mode":true, "bypass":false, "mono":true},
+    {"name":"Parallel Punch", "threshold":-24.0, "ratio":6.0, "attack":6.0, "release":85.0, "makeup":4.2, "mix":55.0, "output":0.0, "rms_mode":false, "bypass":false, "mono":false},
+    {"name":"Fast Limiter", "threshold":-10.0, "ratio":12.0, "attack":0.3, "release":45.0, "makeup":0.8, "mix":100.0, "output":-0.8, "rms_mode":false, "bypass":false, "mono":false},
+    {"name":"Acoustic Leveller", "threshold":-17.0, "ratio":2.4, "attack":18.0, "release":240.0, "makeup":1.6, "mix":100.0, "output":0.0, "rms_mode":true, "bypass":false, "mono":false},
+    {"name":"Bus Tight", "threshold":-15.0, "ratio":2.2, "attack":10.0, "release":110.0, "makeup":1.5, "mix":90.0, "output":-0.4, "rms_mode":true, "bypass":false, "mono":false}
+  ]
+}
