@@ -1,274 +1,565 @@
 #include "PluginProcessor.h"
+#if ! MUSIQUE_DYNAMICS_DSP_TESTS
 #include "PluginEditor.h"
+#endif
+#include "DynamicsEngines.h"
+#include "FXComponents.h"
+#include <cmath>
 
-namespace { static float dbToGain(float dB){ return std::pow(10.0f,dB/20.0f);} }
+namespace
+{
+float getRaw(const juce::AudioProcessorValueTreeState& apvts, const char* id, float fallback = 0.0f)
+{
+    if (auto* value = apvts.getRawParameterValue(id))
+        return value->load();
+    return fallback;
+}
+
+void setParam(juce::AudioProcessorValueTreeState& apvts, const juce::String& id, float value)
+{
+    if (auto* parameter = apvts.getParameter(id))
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+}
+
+bool stateHasParameter(const juce::ValueTree& state, const juce::String& id)
+{
+    for (int index = 0; index < state.getNumChildren(); ++index)
+    {
+        const auto child = state.getChild(index);
+        if (child.hasType("PARAM") && child.getProperty("id").toString() == id)
+            return true;
+    }
+    return false;
+}
+
+void ensureStateParamValue(juce::AudioProcessorValueTreeState& apvts,
+                           const juce::ValueTree& state,
+                           const juce::String& id,
+                           float value)
+{
+    if (!stateHasParameter(state, id))
+        setParam(apvts, id, value);
+}
+
+void setPresetDefault(juce::DynamicObject& object, const juce::Identifier& id, const juce::var& value)
+{
+    if (!object.hasProperty(id))
+        object.setProperty(id, value);
+}
+
+float clampPresetFloat(juce::DynamicObject& object, const juce::Identifier& id, float minimum, float maximum)
+{
+    const auto clamped = juce::jlimit(minimum, maximum, (float) object.getProperty(id));
+    object.setProperty(id, (double) clamped);
+    return clamped;
+}
+
+int clampPresetInt(juce::DynamicObject& object, const juce::Identifier& id, int minimum, int maximum)
+{
+    const auto clamped = juce::jlimit(minimum, maximum, (int) std::round((float) object.getProperty(id)));
+    object.setProperty(id, clamped);
+    return clamped;
+}
+}
+
+juce::StringArray MusiqueCompressorProcessor::getAllParameterIds()
+{
+    return {
+        "engine","variant",
+        "threshold","ratio","attack","release","makeup","rms_mode",
+        "limit_drive","limit_ceiling","limit_release","limit_lookahead","limit_softness",
+        "gate_threshold","gate_range","gate_attack","gate_release","gate_hold",
+        "mb_low","mb_mid","mb_high","mb_glue","mb_recovery",
+        "trans_attack","trans_sustain","trans_sensitivity","trans_speed","trans_clip",
+        "mix","output","bypass","mono"
+    };
+}
 
 MusiqueCompressorProcessor::MusiqueCompressorProcessor()
-: AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), true).withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-  parameters(*this, nullptr, "MusiqueCompressor", createParameterLayout()) {}
+    : AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), true)
+                                      .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      parameters(*this, nullptr, "MusiqueCompressor", createParameterLayout()),
+      compressorEngineState(std::make_unique<dynamics::CompressorEngine>()),
+      limiterEngineState(std::make_unique<dynamics::LimiterEngine>()),
+      gateEngineState(std::make_unique<dynamics::GateEngine>()),
+      multibandEngineState(std::make_unique<dynamics::MultibandEngine>()),
+      transientEngineState(std::make_unique<dynamics::TransientShaperEngine>())
+{
+}
+
+MusiqueCompressorProcessor::~MusiqueCompressorProcessor() = default;
 
 juce::AudioProcessorValueTreeState::ParameterLayout MusiqueCompressorProcessor::createParameterLayout()
 {
-    std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("threshold","Threshold",-60.0f,0.0f,-18.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("ratio","Ratio",1.0f,20.0f,4.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("attack","Attack",0.1f,100.0f,10.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("release","Release",5.0f,1000.0f,120.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("makeup","Makeup",0.0f,24.0f,0.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("mix","Mix",0.0f,100.0f,100.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>("output","Output",-24.0f,12.0f,0.0f));
-    p.push_back(std::make_unique<juce::AudioParameterBool>("rms_mode","RMS Mode",false));
-    p.push_back(std::make_unique<juce::AudioParameterBool>("bypass","Bypass",false));
-    p.push_back(std::make_unique<juce::AudioParameterBool>("mono","Mono",false));
-    return {p.begin(), p.end()};
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+
+    params.push_back(std::make_unique<juce::AudioParameterChoice>("engine", "Engine",
+        juce::StringArray { "Compressor", "Limiter", "Gate/Expander", "Multiband", "Transient" }, 0));
+    params.push_back(std::make_unique<juce::AudioParameterChoice>("variant", "Variant",
+        juce::StringArray { "Variant A", "Variant B", "Variant C" }, 0));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("threshold", "Threshold", -60.0f, 0.0f, -18.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("ratio", "Ratio", 1.0f, 20.0f, 4.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("attack", "Attack", 0.1f, 100.0f, 10.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("release", "Release", 5.0f, 1000.0f, 120.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("makeup", "Makeup", 0.0f, 24.0f, 0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterBool>("rms_mode", "RMS Mode", false));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("limit_drive", "Limit Drive", 0.0f, 24.0f, 4.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("limit_ceiling", "Limit Ceiling", -12.0f, 0.0f, -0.8f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("limit_release", "Limit Release", 5.0f, 400.0f, 60.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("limit_lookahead", "Limit Lookahead", 0.1f, 15.0f, 2.5f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("limit_softness", "Limit Softness", 0.0f, 100.0f, 35.0f));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("gate_threshold", "Gate Threshold", -70.0f, 0.0f, -32.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("gate_range", "Gate Range", 0.0f, 80.0f, 45.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("gate_attack", "Gate Attack", 0.1f, 100.0f, 5.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("gate_release", "Gate Release", 5.0f, 800.0f, 120.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("gate_hold", "Gate Hold", 0.0f, 250.0f, 40.0f));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mb_low", "Multiband Low", 0.0f, 100.0f, 50.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mb_mid", "Multiband Mid", 0.0f, 100.0f, 55.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mb_high", "Multiband High", 0.0f, 100.0f, 45.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mb_glue", "Multiband Glue", 0.0f, 100.0f, 40.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mb_recovery", "Multiband Recovery", 0.0f, 100.0f, 45.0f));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("trans_attack", "Transient Attack", -100.0f, 100.0f, 25.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("trans_sustain", "Transient Sustain", -100.0f, 100.0f, 0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("trans_sensitivity", "Transient Sensitivity", 0.0f, 100.0f, 50.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("trans_speed", "Transient Speed", 0.0f, 100.0f, 50.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("trans_clip", "Transient Clip", 0.0f, 100.0f, 35.0f));
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("mix", "Mix", 0.0f, 100.0f, 100.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>("output", "Output", -24.0f, 12.0f, 0.0f));
+    params.push_back(std::make_unique<juce::AudioParameterBool>("bypass", "Bypass", false));
+    params.push_back(std::make_unique<juce::AudioParameterBool>("mono", "Mono", false));
+
+    return { params.begin(), params.end() };
 }
 
-void MusiqueCompressorProcessor::prepareToPlay(double sr, int bs)
+void MusiqueCompressorProcessor::normalisePresetObject(juce::var& preset)
 {
-    preparedSampleRate = sr;
-    wetBuffer.setSize(2, bs, false, false, true);
-    thresholdSmoothed.reset(sr, 0.02);
-    ratioSmoothed.reset(sr, 0.02);
-    attackSmoothed.reset(sr, 0.03);
-    releaseSmoothed.reset(sr, 0.04);
-    makeupSmoothed.reset(sr, 0.02);
-    mixSmoothed.reset(sr, 0.02);
+    auto* object = preset.getDynamicObject();
+    if (object == nullptr)
+        return;
 
-    thresholdSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("threshold")->load());
-    ratioSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("ratio")->load());
-    attackSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("attack")->load());
-    releaseSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("release")->load());
-    makeupSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("makeup")->load());
-    mixSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("mix")->load() / 100.0f);
-    currentGainReductionDb.store(0.0f, std::memory_order_relaxed);
-    gainReductionEnvelopeDb = 0.0f;
-    detectorEnvelope = 0.0f;
-    detectorRmsPower = 0.0f;
+    const bool legacyRms = object->hasProperty("rms_mode") && (bool) object->getProperty("rms_mode");
+
+    setPresetDefault(*object, "engine", 0);
+    setPresetDefault(*object, "variant", legacyRms ? 1 : 0);
+    setPresetDefault(*object, "threshold", -18.0);
+    setPresetDefault(*object, "ratio", 4.0);
+    setPresetDefault(*object, "attack", 10.0);
+    setPresetDefault(*object, "release", 120.0);
+    setPresetDefault(*object, "makeup", 0.0);
+    setPresetDefault(*object, "rms_mode", false);
+    setPresetDefault(*object, "limit_drive", 4.0);
+    setPresetDefault(*object, "limit_ceiling", -0.8);
+    setPresetDefault(*object, "limit_release", 60.0);
+    setPresetDefault(*object, "limit_lookahead", 2.5);
+    setPresetDefault(*object, "limit_softness", 35.0);
+    setPresetDefault(*object, "gate_threshold", -32.0);
+    setPresetDefault(*object, "gate_range", 45.0);
+    setPresetDefault(*object, "gate_attack", 5.0);
+    setPresetDefault(*object, "gate_release", 120.0);
+    setPresetDefault(*object, "gate_hold", 40.0);
+    setPresetDefault(*object, "mb_low", 50.0);
+    setPresetDefault(*object, "mb_mid", 55.0);
+    setPresetDefault(*object, "mb_high", 45.0);
+    setPresetDefault(*object, "mb_glue", 40.0);
+    setPresetDefault(*object, "mb_recovery", 45.0);
+    setPresetDefault(*object, "trans_attack", 25.0);
+    setPresetDefault(*object, "trans_sustain", 0.0);
+    setPresetDefault(*object, "trans_sensitivity", 50.0);
+    setPresetDefault(*object, "trans_speed", 50.0);
+    setPresetDefault(*object, "trans_clip", 35.0);
+    setPresetDefault(*object, "mix", 100.0);
+    setPresetDefault(*object, "output", 0.0);
+    setPresetDefault(*object, "bypass", false);
+    setPresetDefault(*object, "mono", false);
+
+    const int engine = clampPresetInt(*object, "engine", 0, numEngines - 1);
+    const bool rmsMode = object->hasProperty("rms_mode") && (bool) object->getProperty("rms_mode");
+    const int fallbackVariant = engine == compressor && rmsMode ? 1 : 0;
+    if (!object->hasProperty("variant"))
+        object->setProperty("variant", fallbackVariant);
+    clampPresetInt(*object, "variant", 0, 2);
+
+    clampPresetFloat(*object, "threshold", -60.0f, 0.0f);
+    clampPresetFloat(*object, "ratio", 1.0f, 20.0f);
+    clampPresetFloat(*object, "attack", 0.1f, 100.0f);
+    clampPresetFloat(*object, "release", 5.0f, 1000.0f);
+    clampPresetFloat(*object, "makeup", 0.0f, 24.0f);
+    clampPresetFloat(*object, "limit_drive", 0.0f, 24.0f);
+    clampPresetFloat(*object, "limit_ceiling", -12.0f, 0.0f);
+    clampPresetFloat(*object, "limit_release", 5.0f, 400.0f);
+    clampPresetFloat(*object, "limit_lookahead", 0.1f, 15.0f);
+    clampPresetFloat(*object, "limit_softness", 0.0f, 100.0f);
+    clampPresetFloat(*object, "gate_threshold", -70.0f, 0.0f);
+    clampPresetFloat(*object, "gate_range", 0.0f, 80.0f);
+    clampPresetFloat(*object, "gate_attack", 0.1f, 100.0f);
+    clampPresetFloat(*object, "gate_release", 5.0f, 800.0f);
+    clampPresetFloat(*object, "gate_hold", 0.0f, 250.0f);
+    clampPresetFloat(*object, "mb_low", 0.0f, 100.0f);
+    clampPresetFloat(*object, "mb_mid", 0.0f, 100.0f);
+    clampPresetFloat(*object, "mb_high", 0.0f, 100.0f);
+    clampPresetFloat(*object, "mb_glue", 0.0f, 100.0f);
+    clampPresetFloat(*object, "mb_recovery", 0.0f, 100.0f);
+    clampPresetFloat(*object, "trans_attack", -100.0f, 100.0f);
+    clampPresetFloat(*object, "trans_sustain", -100.0f, 100.0f);
+    clampPresetFloat(*object, "trans_sensitivity", 0.0f, 100.0f);
+    clampPresetFloat(*object, "trans_speed", 0.0f, 100.0f);
+    clampPresetFloat(*object, "trans_clip", 0.0f, 100.0f);
+    clampPresetFloat(*object, "mix", 0.0f, 100.0f);
+    clampPresetFloat(*object, "output", -24.0f, 12.0f);
 }
 
-bool MusiqueCompressorProcessor::isBusesLayoutSupported(const BusesLayout& l) const
-{ return l.getMainInputChannelSet()==juce::AudioChannelSet::stereo() && l.getMainOutputChannelSet()==juce::AudioChannelSet::stereo(); }
+void MusiqueCompressorProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+{
+    preparedSampleRate = sampleRate;
+    preparedBlockCapacity = juce::jmax(juce::jmax(1, samplesPerBlock), 8192);
+    wetBuffer.setSize(2, preparedBlockCapacity, false, false, false);
 
-void MusiqueCompressorProcessor::processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&)
+    mixSmoothed.reset(sampleRate, 0.025);
+    outputSmoothed.reset(sampleRate, 0.025);
+    mixSmoothed.setCurrentAndTargetValue(parameters.getRawParameterValue("mix")->load() / 100.0f);
+    outputSmoothed.setCurrentAndTargetValue(dynamics::dbToGain(parameters.getRawParameterValue("output")->load()));
+
+    compressorEngineState->prepare(sampleRate, preparedBlockCapacity);
+    limiterEngineState->prepare(sampleRate, preparedBlockCapacity);
+    gateEngineState->prepare(sampleRate, preparedBlockCapacity);
+    multibandEngineState->prepare(sampleRate, preparedBlockCapacity);
+    transientEngineState->prepare(sampleRate, preparedBlockCapacity);
+
+    lastEngineIndex = -1;
+    clearSnapshot();
+}
+
+void MusiqueCompressorProcessor::releaseResources()
+{
+    resetAllEngines();
+    wetBuffer.setSize(0, 0);
+    preparedBlockCapacity = 0;
+}
+
+bool MusiqueCompressorProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+{
+    const auto in = layouts.getMainInputChannelSet();
+    const auto out = layouts.getMainOutputChannelSet();
+    return in == out && (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo());
+}
+
+juce::AudioProcessorParameter* MusiqueCompressorProcessor::getBypassParameter() const
+{
+    return const_cast<juce::AudioProcessorValueTreeState&>(parameters).getParameter("bypass");
+}
+
+void MusiqueCompressorProcessor::processBlockBypassed(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    visualState.captureInput(b);
-    const int numSamples = b.getNumSamples();
-    if (numSamples <= 0)
-        return;
-
-    if (*parameters.getRawParameterValue("mono") > 0.5f)
-        for (int i = 0; i < numSamples; ++i)
-        {
-            const float m = 0.5f * (b.getSample(0, i) + b.getSample(1, i));
-            b.setSample(0, i, m);
-            b.setSample(1, i, m);
-        }
-
-    if (*parameters.getRawParameterValue("bypass") > 0.5f)
-    {
-        currentGainReductionDb.store(0.0f, std::memory_order_relaxed);
-        gainReductionEnvelopeDb = 0.0f;
-        detectorEnvelope = 0.0f;
-        detectorRmsPower = 0.0f;
-        b.applyGain(dbToGain(*parameters.getRawParameterValue("output")));
-        visualState.captureOutput(b);
-        return;
-    }
-
-    thresholdSmoothed.setTargetValue(parameters.getRawParameterValue("threshold")->load());
-    ratioSmoothed.setTargetValue(parameters.getRawParameterValue("ratio")->load());
-    attackSmoothed.setTargetValue(parameters.getRawParameterValue("attack")->load());
-    releaseSmoothed.setTargetValue(parameters.getRawParameterValue("release")->load());
-    makeupSmoothed.setTargetValue(parameters.getRawParameterValue("makeup")->load());
-    mixSmoothed.setTargetValue(parameters.getRawParameterValue("mix")->load() / 100.0f);
-
-    const float out = dbToGain(*parameters.getRawParameterValue("output"));
-
-    const bool mixAtZero = mixSmoothed.getCurrentValue() <= 0.0001f && !mixSmoothed.isSmoothing();
-    if (mixAtZero)
-    {
-        currentGainReductionDb.store(0.0f, std::memory_order_relaxed);
-        gainReductionEnvelopeDb = 0.0f;
-        detectorEnvelope = 0.0f;
-        detectorRmsPower = 0.0f;
-        b.applyGain(out);
-        visualState.captureOutput(b);
-        return;
-    }
-
-    const bool rmsMode = *parameters.getRawParameterValue("rms_mode") > 0.5f;
-
-    const bool fullyWet = mixSmoothed.getCurrentValue() >= 0.999f
-        && mixSmoothed.getTargetValue() >= 0.999f
-        && !mixSmoothed.isSmoothing();
-
-    if (! fullyWet)
-    {
-        wetBuffer.setSize(2, numSamples, false, false, true);
-        wetBuffer.makeCopyOf(b, true);
-    }
-
-    constexpr int chunkSize = 32;
-    for (int offset = 0; offset < numSamples; offset += chunkSize)
-    {
-        const int samplesThisChunk = juce::jmin(chunkSize, numSamples - offset);
-        const float threshold = thresholdSmoothed.skip(samplesThisChunk);
-        const float ratio = juce::jmax(1.0f, ratioSmoothed.skip(samplesThisChunk));
-        const float attack = juce::jmax(0.1f, attackSmoothed.skip(samplesThisChunk));
-        const float release = juce::jmax(5.0f, releaseSmoothed.skip(samplesThisChunk));
-        const float makeup = makeupSmoothed.skip(samplesThisChunk);
-        const float mix = mixSmoothed.skip(samplesThisChunk);
-        const float makeupGain = dbToGain(makeup);
-        constexpr float softKneeWidthDb = 6.0f;
-        const float halfKneeDb = softKneeWidthDb * 0.5f;
-        const float attackCoeff = std::exp(-1.0f / (0.001f * attack * (float) preparedSampleRate));
-        const float releaseCoeff = std::exp(-1.0f / (0.001f * release * (float) preparedSampleRate));
-        float chunkMaxReductionDb = 0.0f;
-
-        double inputEnergy = 0.0;
-        double wetEnergy = 0.0;
-        if (fullyWet)
-        {
-            for (int ch = 0; ch < 2; ++ch)
-                for (int i = 0; i < samplesThisChunk; ++i)
-                {
-                    const float sample = b.getSample(ch, offset + i);
-                    inputEnergy += (double) sample * (double) sample;
-                }
-
-            for (int i = 0; i < samplesThisChunk; ++i)
-            {
-                const int sampleIndex = offset + i;
-                const float inL = b.getSample(0, sampleIndex);
-                const float inR = b.getSample(1, sampleIndex);
-                const float linkedPeak = juce::jmax(std::abs(inL), std::abs(inR));
-                float envDb = -120.0f;
-                if (rmsMode)
-                {
-                    const float linkedPower = 0.5f * (inL * inL + inR * inR);
-                    const float detectorValue = std::sqrt(juce::jmax(linkedPower, 0.0f));
-                    const float coeff = detectorValue > std::sqrt(juce::jmax(detectorRmsPower, 0.0f)) ? attackCoeff : releaseCoeff;
-                    detectorRmsPower = linkedPower + coeff * (detectorRmsPower - linkedPower);
-                    envDb = juce::Decibels::gainToDecibels(std::sqrt(juce::jmax(detectorRmsPower, 0.0f)), -120.0f);
-                    detectorEnvelope = 0.0f;
-                }
-                else
-                {
-                    const float coeff = linkedPeak > detectorEnvelope ? attackCoeff : releaseCoeff;
-                    detectorEnvelope = linkedPeak + coeff * (detectorEnvelope - linkedPeak);
-                    envDb = juce::Decibels::gainToDecibels(detectorEnvelope, -120.0f);
-                    detectorRmsPower = 0.0f;
-                }
-
-                float reductionDb = 0.0f;
-                if (envDb > threshold - halfKneeDb)
-                {
-                    if (envDb >= threshold + halfKneeDb)
-                    {
-                        reductionDb = (envDb - threshold) * (1.0f - 1.0f / ratio);
-                    }
-                    else
-                    {
-                        const float overDb = envDb - (threshold - halfKneeDb);
-                        reductionDb = (1.0f - 1.0f / ratio) * (overDb * overDb) / (2.0f * softKneeWidthDb);
-                    }
-                }
-
-                chunkMaxReductionDb = juce::jmax(chunkMaxReductionDb, reductionDb);
-                const float gain = juce::Decibels::decibelsToGain(-reductionDb) * makeupGain * out;
-                b.setSample(0, sampleIndex, inL * gain);
-                b.setSample(1, sampleIndex, inR * gain);
-                wetEnergy += (double) (inL * juce::Decibels::decibelsToGain(-reductionDb)) * (double) (inL * juce::Decibels::decibelsToGain(-reductionDb));
-                wetEnergy += (double) (inR * juce::Decibels::decibelsToGain(-reductionDb)) * (double) (inR * juce::Decibels::decibelsToGain(-reductionDb));
-            }
-
-            const float inRms = std::sqrt((float) (inputEnergy / (double) (samplesThisChunk * 2)));
-            const float wetRms = std::sqrt((float) (wetEnergy / (double) (samplesThisChunk * 2)));
-            const float grDb = juce::jmax(0.0f,
-                juce::jmax(chunkMaxReductionDb,
-                    juce::Decibels::gainToDecibels(inRms, -80.0f) - juce::Decibels::gainToDecibels(wetRms, -80.0f)));
-            gainReductionEnvelopeDb += (grDb > gainReductionEnvelopeDb ? 0.22f : 0.08f) * (grDb - gainReductionEnvelopeDb);
-        }
-        else
-        {
-            double inputChunkEnergy = 0.0;
-            for (int ch = 0; ch < 2; ++ch)
-                for (int i = 0; i < samplesThisChunk; ++i)
-                {
-                    const float sample = wetBuffer.getSample(ch, offset + i);
-                    inputChunkEnergy += (double) sample * (double) sample;
-                }
-
-            for (int i = 0; i < samplesThisChunk; ++i)
-            {
-                const int sampleIndex = offset + i;
-                const float wetInL = wetBuffer.getSample(0, sampleIndex);
-                const float wetInR = wetBuffer.getSample(1, sampleIndex);
-                const float linkedPeak = juce::jmax(std::abs(wetInL), std::abs(wetInR));
-                float envDb = -120.0f;
-                if (rmsMode)
-                {
-                    const float linkedPower = 0.5f * (wetInL * wetInL + wetInR * wetInR);
-                    const float detectorValue = std::sqrt(juce::jmax(linkedPower, 0.0f));
-                    const float coeff = detectorValue > std::sqrt(juce::jmax(detectorRmsPower, 0.0f)) ? attackCoeff : releaseCoeff;
-                    detectorRmsPower = linkedPower + coeff * (detectorRmsPower - linkedPower);
-                    envDb = juce::Decibels::gainToDecibels(std::sqrt(juce::jmax(detectorRmsPower, 0.0f)), -120.0f);
-                    detectorEnvelope = 0.0f;
-                }
-                else
-                {
-                    const float coeff = linkedPeak > detectorEnvelope ? attackCoeff : releaseCoeff;
-                    detectorEnvelope = linkedPeak + coeff * (detectorEnvelope - linkedPeak);
-                    envDb = juce::Decibels::gainToDecibels(detectorEnvelope, -120.0f);
-                    detectorRmsPower = 0.0f;
-                }
-
-                float reductionDb = 0.0f;
-                if (envDb > threshold - halfKneeDb)
-                {
-                    if (envDb >= threshold + halfKneeDb)
-                    {
-                        reductionDb = (envDb - threshold) * (1.0f - 1.0f / ratio);
-                    }
-                    else
-                    {
-                        const float overDb = envDb - (threshold - halfKneeDb);
-                        reductionDb = (1.0f - 1.0f / ratio) * (overDb * overDb) / (2.0f * softKneeWidthDb);
-                    }
-                }
-
-                chunkMaxReductionDb = juce::jmax(chunkMaxReductionDb, reductionDb);
-                const float compressedGain = juce::Decibels::decibelsToGain(-reductionDb);
-                const float wetCompressedL = wetInL * compressedGain;
-                const float wetCompressedR = wetInR * compressedGain;
-                wetEnergy += (double) wetCompressedL * (double) wetCompressedL;
-                wetEnergy += (double) wetCompressedR * (double) wetCompressedR;
-
-                const float wetWithMakeupL = wetCompressedL * makeupGain;
-                const float wetWithMakeupR = wetCompressedR * makeupGain;
-                const float dryL = b.getSample(0, sampleIndex);
-                const float dryR = b.getSample(1, sampleIndex);
-                b.setSample(0, sampleIndex, (dryL * (1.0f - mix) + wetWithMakeupL * mix) * out);
-                b.setSample(1, sampleIndex, (dryR * (1.0f - mix) + wetWithMakeupR * mix) * out);
-            }
-
-            const float inRms = std::sqrt((float) (inputChunkEnergy / (double) (samplesThisChunk * 2)));
-            const float wetRms = std::sqrt((float) (wetEnergy / (double) (samplesThisChunk * 2)));
-            const float grDb = juce::jmax(0.0f,
-                juce::jmax(chunkMaxReductionDb,
-                    juce::Decibels::gainToDecibels(inRms, -80.0f) - juce::Decibels::gainToDecibels(wetRms, -80.0f)));
-            gainReductionEnvelopeDb += (grDb > gainReductionEnvelopeDb ? 0.22f : 0.08f) * (grDb - gainReductionEnvelopeDb);
-        }
-    }
-
-    currentGainReductionDb.store(gainReductionEnvelopeDb, std::memory_order_relaxed);
-
-    visualState.captureOutput(b);
+    visualState.captureInput(buffer);
+    clearSnapshot();
+    visualState.captureOutput(buffer);
 }
 
-void MusiqueCompressorProcessor::getStateInformation(juce::MemoryBlock& d){ auto s=parameters.copyState(); std::unique_ptr<juce::XmlElement> x(s.createXml()); copyXmlToBinary(*x,d);} 
-void MusiqueCompressorProcessor::setStateInformation(const void* data,int size){ std::unique_ptr<juce::XmlElement> x(getXmlFromBinary(data,size)); if (x && x->hasTagName(parameters.state.getType())) parameters.replaceState(juce::ValueTree::fromXml(*x)); }
+void MusiqueCompressorProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+{
+    juce::ignoreUnused(midiMessages);
+    juce::ScopedNoDenormals noDenormals;
+    visualState.captureInput(buffer);
 
-juce::AudioProcessorEditor* MusiqueCompressorProcessor::createEditor(){ return new MusiqueCompressorEditor(*this);} 
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){ return new MusiqueCompressorProcessor(); }
+    const int numSamples = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
+    if (numSamples <= 0 || numChannels <= 0)
+        return;
+
+    if (getRaw(parameters, "bypass") > 0.5f)
+    {
+        processBlockBypassed(buffer, midiMessages);
+        return;
+    }
+
+    const float rawMix = juce::jlimit(0.0f, 100.0f, getRaw(parameters, "mix", 100.0f));
+    if (rawMix <= 0.0001f)
+    {
+        clearSnapshot();
+        visualState.captureOutput(buffer);
+        return;
+    }
+
+    if (numSamples > wetBuffer.getNumSamples())
+    {
+        preparedBlockCapacity = numSamples;
+        wetBuffer.setSize(2, preparedBlockCapacity, false, false, false);
+    }
+
+    wetBuffer.clear(0, 0, numSamples);
+    wetBuffer.clear(1, 0, numSamples);
+
+    const bool hasStereo = numChannels > 1;
+    const bool mono = getRaw(parameters, "mono") > 0.5f;
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        float left = buffer.getSample(0, sample);
+        float right = hasStereo ? buffer.getSample(1, sample) : left;
+        if (mono)
+            left = right = 0.5f * (left + right);
+
+        wetBuffer.setSample(0, sample, left);
+        wetBuffer.setSample(1, sample, right);
+    }
+
+    const int engine = juce::jlimit(0, numEngines - 1, (int) std::round(getRaw(parameters, "engine")));
+    const int rawVariant = juce::jlimit(0, 2, (int) std::round(getRaw(parameters, "variant")));
+    if (engine != lastEngineIndex)
+    {
+        resetAllEngines();
+        lastEngineIndex = engine;
+    }
+
+    float primary = 0.0f;
+    float secondary = 0.0f;
+    std::array<float, 3> bandReduction {};
+    float transientAttack = 0.0f;
+    float transientSustain = 0.0f;
+
+    switch (engine)
+    {
+        case compressor:
+        {
+            const bool rmsMode = getRaw(parameters, "rms_mode") > 0.5f;
+            const int compressorVariant = rawVariant == 2 ? 2 : (rmsMode ? 1 : 0);
+            compressorEngineState->process(
+                wetBuffer,
+                compressorVariant,
+                getRaw(parameters, "threshold", -18.0f),
+                getRaw(parameters, "ratio", 4.0f),
+                getRaw(parameters, "attack", 10.0f),
+                getRaw(parameters, "release", 120.0f),
+                getRaw(parameters, "makeup"),
+                rmsMode,
+                primary,
+                secondary);
+            break;
+        }
+
+        case limiter:
+            limiterEngineState->process(
+                wetBuffer,
+                rawVariant,
+                getRaw(parameters, "limit_drive", 4.0f),
+                getRaw(parameters, "limit_ceiling", -0.8f),
+                getRaw(parameters, "limit_release", 60.0f),
+                getRaw(parameters, "limit_lookahead", 2.5f),
+                getRaw(parameters, "limit_softness", 35.0f),
+                primary,
+                secondary);
+            break;
+
+        case gateExpander:
+            gateEngineState->process(
+                wetBuffer,
+                rawVariant,
+                getRaw(parameters, "gate_threshold", -32.0f),
+                getRaw(parameters, "gate_range", 45.0f),
+                getRaw(parameters, "gate_attack", 5.0f),
+                getRaw(parameters, "gate_release", 120.0f),
+                getRaw(parameters, "gate_hold", 40.0f),
+                primary,
+                secondary);
+            break;
+
+        case multiband:
+            multibandEngineState->process(
+                wetBuffer,
+                rawVariant,
+                getRaw(parameters, "mb_low", 50.0f),
+                getRaw(parameters, "mb_mid", 55.0f),
+                getRaw(parameters, "mb_high", 45.0f),
+                getRaw(parameters, "mb_glue", 40.0f),
+                getRaw(parameters, "mb_recovery", 45.0f),
+                bandReduction,
+                primary,
+                secondary);
+            break;
+
+        case transientShaper:
+            transientEngineState->process(
+                wetBuffer,
+                rawVariant,
+                getRaw(parameters, "trans_attack", 25.0f),
+                getRaw(parameters, "trans_sustain"),
+                getRaw(parameters, "trans_sensitivity", 50.0f),
+                getRaw(parameters, "trans_speed", 50.0f),
+                getRaw(parameters, "trans_clip", 35.0f),
+                primary,
+                secondary,
+                transientAttack,
+                transientSustain);
+            break;
+
+        default:
+            break;
+    }
+
+    mixSmoothed.setTargetValue(rawMix / 100.0f);
+    outputSmoothed.setTargetValue(dynamics::dbToGain(getRaw(parameters, "output")));
+
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        const float mix = juce::jlimit(0.0f, 1.0f, mixSmoothed.getNextValue());
+        const float output = outputSmoothed.getNextValue();
+        for (int channel = 0; channel < numChannels; ++channel)
+        {
+            const float dry = buffer.getSample(channel, sample);
+            const float wet = wetBuffer.getSample(channel == 0 ? 0 : 1, sample);
+            buffer.setSample(channel, sample, (dry * (1.0f - mix) + wet * mix) * output);
+        }
+    }
+
+    storeSnapshot(primary, secondary, bandReduction, transientAttack, transientSustain);
+    visualState.captureOutput(buffer);
+}
+
+juce::AudioProcessorEditor* MusiqueCompressorProcessor::createEditor()
+{
+#if MUSIQUE_DYNAMICS_DSP_TESTS
+    return nullptr;
+#else
+    return new MusiqueCompressorEditor(*this);
+#endif
+}
+
+void MusiqueCompressorProcessor::getStateInformation(juce::MemoryBlock& destination)
+{
+    auto state = parameters.copyState();
+    normaliseStateTree(state);
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml, destination);
+}
+
+void MusiqueCompressorProcessor::setStateInformation(const void* data, int sizeInBytes)
+{
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
+    if (xml == nullptr || !xml->hasTagName(parameters.state.getType()))
+        return;
+
+    auto state = juce::ValueTree::fromXml(*xml);
+    normaliseStateTree(state);
+    parameters.replaceState(state);
+    ensureStateParamValue(parameters, state, "engine", 0.0f);
+    ensureStateParamValue(parameters, state, "variant", 0.0f);
+    ensureStateParamValue(parameters, state, "bypass", 0.0f);
+    ensureStateParamValue(parameters, state, "mono", 0.0f);
+    lastEngineIndex = -1;
+}
+
+DynamicsSnapshot MusiqueCompressorProcessor::getDynamicsSnapshot() const noexcept
+{
+    return {
+        primaryReductionDb.load(std::memory_order_relaxed),
+        secondaryReductionDb.load(std::memory_order_relaxed),
+        {
+            bandReductionLow.load(std::memory_order_relaxed),
+            bandReductionMid.load(std::memory_order_relaxed),
+            bandReductionHigh.load(std::memory_order_relaxed)
+        },
+        transientAttackDelta.load(std::memory_order_relaxed),
+        transientSustainDelta.load(std::memory_order_relaxed)
+    };
+}
+
+void MusiqueCompressorProcessor::resetAllEngines()
+{
+    if (compressorEngineState != nullptr)
+        compressorEngineState->reset();
+    if (limiterEngineState != nullptr)
+        limiterEngineState->reset();
+    if (gateEngineState != nullptr)
+        gateEngineState->reset();
+    if (multibandEngineState != nullptr)
+        multibandEngineState->reset();
+    if (transientEngineState != nullptr)
+        transientEngineState->reset();
+    clearSnapshot();
+}
+
+void MusiqueCompressorProcessor::clearSnapshot() noexcept
+{
+    std::array<float, 3> zeroBands {};
+    storeSnapshot(0.0f, 0.0f, zeroBands, 0.0f, 0.0f);
+}
+
+void MusiqueCompressorProcessor::storeSnapshot(float primary,
+                                               float secondary,
+                                               const std::array<float, 3>& bandReduction,
+                                               float transientAttack,
+                                               float transientSustain) noexcept
+{
+    primaryReductionDb.store(primary, std::memory_order_relaxed);
+    secondaryReductionDb.store(secondary, std::memory_order_relaxed);
+    bandReductionLow.store(bandReduction[0], std::memory_order_relaxed);
+    bandReductionMid.store(bandReduction[1], std::memory_order_relaxed);
+    bandReductionHigh.store(bandReduction[2], std::memory_order_relaxed);
+    transientAttackDelta.store(transientAttack, std::memory_order_relaxed);
+    transientSustainDelta.store(transientSustain, std::memory_order_relaxed);
+}
+
+void MusiqueCompressorProcessor::normaliseStateTree(juce::ValueTree& state)
+{
+    auto findParamChild = [&state](const juce::String& id) -> juce::ValueTree
+    {
+        for (int index = 0; index < state.getNumChildren(); ++index)
+        {
+            auto child = state.getChild(index);
+            if (child.hasType("PARAM") && child.getProperty("id").toString() == id)
+                return child;
+        }
+        return {};
+    };
+
+    auto readValue = [&state, &findParamChild](const juce::String& id, float fallback) -> float
+    {
+        if (auto child = findParamChild(id); child.isValid())
+            return (float) child.getProperty("value", fallback);
+        if (state.hasProperty(id))
+            return (float) state.getProperty(id, fallback);
+        return fallback;
+    };
+
+    auto writeValue = [&state, &findParamChild](const juce::String& id, float value)
+    {
+        auto child = findParamChild(id);
+        if (!child.isValid())
+        {
+            child = juce::ValueTree("PARAM");
+            child.setProperty("id", id, nullptr);
+            state.addChild(child, -1, nullptr);
+        }
+        child.setProperty("value", value, nullptr);
+        if (state.hasProperty(id))
+            state.removeProperty(id, nullptr);
+    };
+
+    const bool rmsMode = readValue("rms_mode", 0.0f) > 0.5f;
+    const int engineValue = juce::jlimit(0, numEngines - 1, (int) std::round(readValue("engine", 0.0f)));
+    const int fallbackVariant = engineValue == compressor && rmsMode ? 1 : 0;
+    const int variantValue = juce::jlimit(0, 2, (int) std::round(readValue("variant", (float) fallbackVariant)));
+
+    writeValue("engine", (float) engineValue);
+    writeValue("variant", (float) variantValue);
+    writeValue("bypass", readValue("bypass", 0.0f) > 0.5f ? 1.0f : 0.0f);
+    writeValue("mono", readValue("mono", 0.0f) > 0.5f ? 1.0f : 0.0f);
+}
+
+void MusiqueCompressorProcessor::applyPresetCompat(const juce::var& preset)
+{
+    auto normalised = preset;
+    normalisePresetObject(normalised);
+    fx::preset::applyToAPVTS(parameters, normalised);
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new MusiqueCompressorProcessor();
+}

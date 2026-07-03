@@ -1,13 +1,28 @@
 {
-  "plugin": "Musique Compressor",
+  "plugin": "Musique Dynamics",
+  "bank_version": 2,
   "presets": [
-    {"name":"Vocal Glue", "threshold":-19.0, "ratio":3.0, "attack":8.0, "release":95.0, "makeup":2.2, "mix":100.0, "output":0.0, "rms_mode":true, "bypass":false, "mono":false},
-    {"name":"Drum Smash", "threshold":-26.0, "ratio":8.0, "attack":2.0, "release":70.0, "makeup":5.5, "mix":82.0, "output":-1.0, "rms_mode":false, "bypass":false, "mono":false},
-    {"name":"Master Gentle", "threshold":-14.0, "ratio":1.8, "attack":22.0, "release":180.0, "makeup":1.1, "mix":100.0, "output":-0.5, "rms_mode":true, "bypass":false, "mono":false},
-    {"name":"Bass Control", "threshold":-21.0, "ratio":4.5, "attack":12.0, "release":130.0, "makeup":2.8, "mix":96.0, "output":-0.7, "rms_mode":true, "bypass":false, "mono":true},
-    {"name":"Parallel Punch", "threshold":-24.0, "ratio":6.0, "attack":6.0, "release":85.0, "makeup":4.2, "mix":55.0, "output":0.0, "rms_mode":false, "bypass":false, "mono":false},
-    {"name":"Fast Limiter", "threshold":-10.0, "ratio":12.0, "attack":0.3, "release":45.0, "makeup":0.8, "mix":100.0, "output":-0.8, "rms_mode":false, "bypass":false, "mono":false},
-    {"name":"Acoustic Leveller", "threshold":-17.0, "ratio":2.4, "attack":18.0, "release":240.0, "makeup":1.6, "mix":100.0, "output":0.0, "rms_mode":true, "bypass":false, "mono":false},
-    {"name":"Bus Tight", "threshold":-15.0, "ratio":2.2, "attack":10.0, "release":110.0, "makeup":1.5, "mix":90.0, "output":-0.4, "rms_mode":true, "bypass":false, "mono":false}
+    {"name":"Vocal Glue", "category":"Compressor", "engine":0, "variant":1, "threshold":-19.0, "ratio":3.0, "attack":8.0, "release":95.0, "makeup":2.2, "rms_mode":true, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Drum Smash", "category":"Compressor", "engine":0, "variant":0, "threshold":-26.0, "ratio":8.0, "attack":2.0, "release":70.0, "makeup":5.5, "rms_mode":false, "mix":82.0, "output":-1.0, "bypass":false, "mono":false},
+    {"name":"Master Gentle", "category":"Compressor", "engine":0, "variant":1, "threshold":-14.0, "ratio":1.8, "attack":22.0, "release":180.0, "makeup":1.1, "rms_mode":true, "mix":100.0, "output":-0.5, "bypass":false, "mono":false},
+    {"name":"Bass Control", "category":"Compressor", "engine":0, "variant":1, "threshold":-21.0, "ratio":4.5, "attack":12.0, "release":130.0, "makeup":2.8, "rms_mode":true, "mix":96.0, "output":-0.7, "bypass":false, "mono":true},
+    {"name":"Parallel Punch", "category":"Compressor", "engine":0, "variant":0, "threshold":-24.0, "ratio":6.0, "attack":6.0, "release":85.0, "makeup":4.2, "rms_mode":false, "mix":55.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Bus Tight", "category":"Compressor", "engine":0, "variant":2, "threshold":-15.0, "ratio":2.2, "attack":10.0, "release":110.0, "makeup":1.5, "rms_mode":true, "mix":90.0, "output":-0.4, "bypass":false, "mono":false},
+
+    {"name":"Limiter - Fast Safety", "category":"Limiter", "engine":1, "variant":0, "limit_drive":4.0, "limit_ceiling":-0.8, "limit_release":45.0, "limit_lookahead":2.0, "limit_softness":24.0, "mix":100.0, "output":-0.8, "bypass":false, "mono":false},
+    {"name":"Limiter - Broadcast Clean", "category":"Limiter", "engine":1, "variant":0, "limit_drive":8.0, "limit_ceiling":-1.0, "limit_release":90.0, "limit_lookahead":3.2, "limit_softness":28.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Limiter - Punch Clamp", "category":"Limiter", "engine":1, "variant":1, "limit_drive":10.5, "limit_ceiling":-0.5, "limit_release":42.0, "limit_lookahead":1.6, "limit_softness":18.0, "mix":92.0, "output":-0.3, "bypass":false, "mono":false},
+    {"name":"Limiter - ClipSafe Master", "category":"Limiter", "engine":1, "variant":2, "limit_drive":6.5, "limit_ceiling":-1.2, "limit_release":130.0, "limit_lookahead":5.0, "limit_softness":62.0, "mix":100.0, "output":-0.4, "bypass":false, "mono":false},
+
+    {"name":"Gate - Drum Tight", "category":"Gate", "engine":2, "variant":0, "gate_threshold":-28.0, "gate_range":56.0, "gate_attack":1.0, "gate_release":84.0, "gate_hold":28.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Expander - Room Control", "category":"Gate", "engine":2, "variant":1, "gate_threshold":-34.0, "gate_range":24.0, "gate_attack":6.0, "gate_release":160.0, "gate_hold":62.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Gate - Soft Vocal Clean", "category":"Gate", "engine":2, "variant":2, "gate_threshold":-42.0, "gate_range":32.0, "gate_attack":12.0, "gate_release":220.0, "gate_hold":80.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+
+    {"name":"Multiband - Punch Bus", "category":"Multiband", "engine":3, "variant":0, "mb_low":62.0, "mb_mid":48.0, "mb_high":38.0, "mb_glue":34.0, "mb_recovery":36.0, "mix":100.0, "output":-0.4, "bypass":false, "mono":false},
+    {"name":"Multiband - Glue Master", "category":"Multiband", "engine":3, "variant":1, "mb_low":40.0, "mb_mid":46.0, "mb_high":34.0, "mb_glue":62.0, "mb_recovery":58.0, "mix":100.0, "output":-0.5, "bypass":false, "mono":false},
+    {"name":"Multiband - Control Bass", "category":"Multiband", "engine":3, "variant":2, "mb_low":72.0, "mb_mid":44.0, "mb_high":28.0, "mb_glue":48.0, "mb_recovery":42.0, "mix":94.0, "output":-0.6, "bypass":false, "mono":true},
+
+    {"name":"Transient - Punch Drums", "category":"Transient", "engine":4, "variant":0, "trans_attack":46.0, "trans_sustain":-10.0, "trans_sensitivity":58.0, "trans_speed":62.0, "trans_clip":28.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false},
+    {"name":"Transient - Smooth Sustain", "category":"Transient", "engine":4, "variant":2, "trans_attack":-12.0, "trans_sustain":36.0, "trans_sensitivity":44.0, "trans_speed":34.0, "trans_clip":22.0, "mix":100.0, "output":0.0, "bypass":false, "mono":false}
   ]
 }
